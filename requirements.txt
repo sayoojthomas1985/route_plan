@@ -1,0 +1,34 @@
+# Web framework
+flask>=2.3.2
+flask-cors>=4.0.0
+
+# AWS SDK
+boto3>=1.26.0
+
+# Database
+SQLAlchemy>=2.0.19
+PyMySQL>=1.1.1
+
+# Data handling
+pandas>=2.1.0
+numpy>=1.26.0
+openpyxl>=3.1.2  # for Excel output
+
+# Machine learning / clustering
+scikit-learn>=1.3.0
+haversine>=2.8.0
+
+# Google API / OAuth
+google-api-python-client>=2.99.0
+google-auth-oauthlib>=1.2.0
+google-auth-httplib2>=0.1.0
+requests>=2.31.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# Messaging
+twilio>=8.9.0
+
+# Optional (PDFs)
+reportlab>=4.0
