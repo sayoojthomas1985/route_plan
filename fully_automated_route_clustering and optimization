@@ -1,0 +1,846 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[13]:
+def run_delivery_script():
+    from sqlalchemy import create_engine
+    from datetime import datetime, timezone, timedelta
+    import pandas as pd
+    import numpy as np
+    import math
+    from sklearn.cluster import KMeans
+    from haversine import haversine
+    import warnings
+    import time
+    import itertools
+    import pymysql
+    from googleapiclient.discovery import build
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from google.auth.transport.requests import Request
+    import base64
+    import os
+    import pickle
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.base import MIMEBase
+    from email import encoders
+    from dotenv import load_dotenv
+    from glob import glob
+    import boto3
+    # === Load environment variables ===
+    load_dotenv()
+    
+    DB_HOST = os.getenv("DB_HOST")
+    DB_PORT = int(os.getenv("DB_PORT"))
+    DB_USER = os.getenv("DB_USER")
+    DB_PASSWORD = os.getenv("DB_PASSWORD")
+    DB_NAME = os.getenv("DB_NAME")
+
+    SCOPES = ['https://www.googleapis.com/auth/gmail.send']
+
+    # === Logging ===
+    with open('/home/ubuntu/cron_debug.log', 'a') as f:
+        f.write(f"Script started at {datetime.now()}\n")
+    
+    start_time = time.time()
+    warnings.filterwarnings("ignore")
+    
+    # === SQLAlchemy Engine ===
+    engine = create_engine(
+        f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+    )
+    
+    
+    sessions = ["Morning", "Lunch", "Dinner"]
+    all_reports = []
+    route_plan_files = {}
+    map_links_files = {}
+    executive_html_files = {}
+
+
+    
+    def send_email_with_s3_links(to_list, subject, links):
+        service = gmail_authenticate()
+        message = MIMEMultipart()
+        message['to'] = ", ".join(to_list)
+        message['from'] = "vijay.g@keralaenterprises.com"
+        message['subject'] = subject
+
+        labels = [
+            "Morning Route Plan",
+            "Morning Map Links",
+            "Lunch Route Plan",
+            "Lunch Map Links",
+            "Dinner Route Plan",
+            "Dinner Map Links"
+        ]
+
+        html_body = """
+        <html>
+        <body style="font-family: Arial, sans-serif; color: #333;">
+          <h2>Delivery Route Plans</h2>
+          <p>Please find the route plans and map links for each session below:</p>
+        """
+
+        for label, link in zip(labels, links):
+            html_body += f"""
+            <p>
+              <a href="{link}" target="_blank" style="
+                  display: inline-block;
+                  padding: 10px 18px;
+                  margin: 6px 0;
+                  font-size: 16px;
+                  color: white !important;
+                  background-color: #0073e6;
+                  text-decoration: none;
+                  border-radius: 5px;
+                  ">
+                {label}
+              </a>
+            </p>
+            """
+
+        html_body += """
+          <p>Click the buttons to open the files and maps.</p>
+        </body>
+        </html>
+        """
+
+        message.attach(MIMEText(html_body, 'html'))
+
+        raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
+        service.users().messages().send(userId="me", body={'raw': raw_message}).execute()
+    
+      
+      
+        
+    def gmail_authenticate():
+        creds = None
+        if os.path.exists('token.pickle'):
+            with open('token.pickle', 'rb') as token:
+                creds = pickle.load(token)
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+                creds = flow.run_local_server(port=0)
+            with open('token.pickle', 'wb') as token:
+                pickle.dump(creds, token)
+        return build('gmail', 'v1', credentials=creds)
+        
+    def create_message_with_attachment(sender, to_list, subject, body_text, file):
+        """
+        Create an email with an attachment.
+        :param sender: Sender email address.
+        :param to_list: List of recipient email addresses.
+        :param subject: Email subject.
+        :param body_text: Email body text.
+        :param file: Path to the file attachment.
+        """
+        message = MIMEMultipart()
+        message['to'] = ", ".join(to_list)  # Ensure multiple recipients are handled
+        message['from'] = sender
+        message['subject'] = subject        
+        message.attach(MIMEText(body_text, 'plain'))
+        
+        with open(file, 'rb') as f:
+            part = MIMEBase('application', 'octet-stream')
+            part.set_payload(f.read())
+            encoders.encode_base64(part)
+            part.add_header('Content-Disposition', f'attachment; filename="{os.path.basename(file)}"')
+            message.attach(part) 
+    
+        raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
+        return {'raw': raw_message}
+
+        
+    def upload_to_s3(file_path, bucket_name, expiration=86400):  # 24 hours
+        region = os.environ.get('AWS_REGION', 'ap-south-1')
+        s3 = boto3.client("s3", region_name=region)
+        key = os.path.basename(file_path)
+        # Upload the file first
+        s3.upload_file(file_path, bucket_name, key)
+            
+        # Generate a presigned URL valid for 24 hours
+        presigned_url = s3.generate_presigned_url(
+            'get_object',
+            Params={'Bucket': bucket_name, 'Key': key},
+            ExpiresIn=expiration
+            )
+            
+        return presigned_url  # <---- You must return the URL!
+        
+    for session in sessions:
+        # === Fetch Active Customer IDs ===
+        status_column = f"{session.lower()}_status"  # morning_status/lunch_status/dinner_status
+        customer_query = f"""
+        SELECT customer_id 
+        FROM customer_subscriptions 
+        WHERE {status_column} = 'YES';
+        """
+        
+        customer_ids = pd.read_sql(customer_query, engine)['customer_id'].tolist()
+        if not customer_ids:
+            print(f"No customers found for session {session}")
+            exit()
+        
+        ids_str = ','.join(map(str, customer_ids))
+        
+        # === Fetch Deliveries for Active Customers ===
+        QUERY = f"""
+        SELECT ID, Date, Delivery_Name, Location, Packages, Final_Latitude, Final_Longitude, Coords, Distance_Diff_km
+        FROM Deliveries
+        WHERE ID IN ({ids_str});
+        """
+        
+        df = pd.read_sql(QUERY, engine)
+        print(f"Filtered Deliveries Loaded: {len(df)} records")
+    
+        query = """
+        SELECT CONCAT(c.first_name, ' ', c.last_name, ' (', c.whatsapp_number, ')') AS exec_name
+        FROM delivery_executive_profile dep
+        JOIN contacts c ON dep.user_id = c.user_id
+        WHERE dep.status = 'ACTIVE'
+        ORDER BY dep.user_id"""
+        
+        exec_df = pd.read_sql(query, engine)
+    
+        # Create EXECUTIVE_NAMES list
+        EXECUTIVE_NAMES = exec_df['exec_name'].tolist()
+        
+        
+        # In[14]:
+        
+        
+        df = df.dropna(subset=["Final_Latitude", "Final_Longitude"])
+        df['Coords'] = df.apply(
+            lambda x: tuple(map(float, str(x['Coords']).strip("()").split(','))) 
+                      if pd.notnull(x['Coords']) else (x['Final_Latitude'], x['Final_Longitude']),
+            axis=1
+        )
+        
+        # === CONFIGURATION ===
+        MAX_POINTS = 20
+        MAX_TIME = 120
+        MIN_TIME = 90
+        MAX_TIME_ABS = 130
+        TARGET_AVG_TIME = 104.5
+        AVERAGE_SPEED = 25
+        DEPOT = (10.0352754, 76.4100184)
+        MAX_ATTEMPTS = 25
+        
+        MAX_MOVE = 5
+        MAX_WAYPOINTS = 23  # Google Maps max waypoints
+        # === HELPERS ===
+        
+        def compute_distance(c1, c2):
+            return haversine(c1, c2)
+        
+        def route_distance(coords):
+            dist = 0
+            last = DEPOT
+            for pt in coords:
+                dist += compute_distance(last, pt)
+                last = pt
+            dist += compute_distance(last, DEPOT)
+            return dist
+        
+        def calculate_time_km(points):
+            if not points: return 0, 0
+            coords = [x[0] for x in points]
+            dist = route_distance(coords)
+            time = dist / AVERAGE_SPEED * 60
+            return round(dist, 1), round(time, 1)
+        
+        
+        # === INITIAL CLUSTERING ===
+        def initial_cluster(df):
+            k = math.ceil(len(df) / MAX_POINTS)
+            km = KMeans(n_clusters=k, random_state=1).fit(df[['Final_Latitude', 'Final_Longitude']])
+            df['Cluster'] = km.labels_
+            return df
+        
+        # === CLUSTER SUMMARY ===
+        def cluster_summary(df, phase):
+            summary = []
+            for c_id, group in df.groupby('Cluster'):
+                pts = list(zip(group['Coords'], [1]*len(group)))
+                dist, time = calculate_time_km(pts)
+                overloaded = time > MAX_TIME_ABS or len(group) > MAX_POINTS
+                underused = time < MIN_TIME
+                summary.append({
+                    'Phase': phase,
+                    'Cluster_ID': c_id,
+                    'Points': len(group),
+                    'Packages': group.get('Packages', pd.Series([1]*len(group))).sum(),
+                    'KMs': dist,
+                    'Time_Minutes': time,
+                    'Overloaded': overloaded,
+                    'Underused': underused
+                })
+            return pd.DataFrame(summary)
+        
+        # === REBALANCE CLUSTERS ===
+        def rebalance(df):
+            for attempt in range(MAX_ATTEMPTS):
+                clusters = cluster_summary(df, 'After')
+                avg_time = clusters['Time_Minutes'].mean()
+        
+                if all((~clusters['Overloaded']) & (~clusters['Underused'])) and avg_time >= TARGET_AVG_TIME:
+                    return df
+        
+                # --- SPLIT OVERLOADED ---
+                max_time_cluster = clusters.sort_values('Time_Minutes', ascending=False).iloc[0]
+                if max_time_cluster['Time_Minutes'] > MAX_TIME_ABS:
+                    cid = max_time_cluster['Cluster_ID']
+                    split_df = df[df['Cluster'] == cid]
+                    keep_df = df[df['Cluster'] != cid]
+                    if len(split_df) < 4:
+                        continue
+                    km = KMeans(n_clusters=2, random_state=attempt+2).fit(split_df[['Final_Latitude', 'Final_Longitude']])
+                    split_df['Cluster'] = km.labels_ + df['Cluster'].max() + 1
+                    df = pd.concat([keep_df, split_df], ignore_index=True)
+        
+                # --- MERGE UNDERUSED ---
+                min_time_cluster = clusters.sort_values('Time_Minutes').iloc[0]
+                if min_time_cluster['Time_Minutes'] < MIN_TIME:
+                    cid = min_time_cluster['Cluster_ID']
+                    remove_df = df[df['Cluster'] == cid]
+                    df = df[df['Cluster'] != cid]
+        
+                    # Check if there are other clusters to merge into
+                    if df.empty or df['Cluster'].nunique() == 0:
+                        df = pd.concat([df, remove_df], ignore_index=True)
+                        continue
+        
+                    nearest = df.copy()
+                    nearest['dist'] = nearest['Coords'].apply(lambda x: compute_distance(x, remove_df['Coords'].iloc[0]))
+        
+                    if nearest.empty:
+                        df = pd.concat([df, remove_df], ignore_index=True)
+                        continue
+        
+                    nearest_cluster = nearest.groupby('Cluster')['dist'].mean().idxmin()
+                    remove_df['Cluster'] = nearest_cluster
+                    df = pd.concat([df, remove_df], ignore_index=True)
+        
+            return df
+        
+        # === FINAL FIX FOR OVER/UNDERUSED ===
+        def fix_final_imbalance_best(df_original):
+            best_df = df_original.copy()
+            best_score = float('inf')
+        
+            for max_move in range(1, 6):
+                df = df_original.copy()
+                clusters = cluster_summary(df, "Final")
+                overloaded = clusters[clusters['Overloaded']]['Cluster_ID'].tolist()
+                underused = clusters[clusters['Underused']]['Cluster_ID'].tolist()
+        
+                for oid in overloaded:
+                    donor_df = df[df['Cluster'] == oid]
+                    for uid in underused:
+                        receiver_df = df[df['Cluster'] == uid]
+                        if receiver_df.empty or donor_df.empty:
+                            continue
+                        distances = [
+                            (idx, compute_distance(row['Coords'], receiver_df['Coords'].iloc[0]))
+                            for idx, row in donor_df.iterrows()
+                        ]
+                        distances.sort(key=lambda x: x[1])
+                        to_move = [idx for idx, _ in distances[:max_move]]
+                        if not to_move:
+                            continue
+                        df.loc[to_move, 'Cluster'] = uid
+        
+                summary = cluster_summary(df.copy(), f"MAX_MOVE={max_move}")
+                time_diffs = abs(summary["Time_Minutes"] - 150)
+                score = time_diffs.sum()
+        
+                if score < best_score:
+                    best_score = score
+                    best_df = df.copy()
+        
+            return best_df
+        
+        def best_by_std_dev(df_base):
+            best_df = None
+            best_summary = None
+            best_std = float('inf')
+        
+            for attempt in range(MAX_ATTEMPTS):
+                df_clustered = initial_cluster(df_base.copy())
+                df_rebalanced = rebalance(df_clustered.copy())
+                if df_rebalanced is None or df_rebalanced.empty:
+                    continue  # Skip invalid attempts
+        
+                summary = cluster_summary(df_rebalanced, f"Attempt_{attempt+1}")
+                std_dev = summary['Time_Minutes'].std()
+        
+                if std_dev < best_std:
+                    best_std = std_dev
+                    best_df = df_rebalanced.copy()
+                    best_summary = summary.copy()
+        
+            # Fallback if no valid clustering found
+            if best_df is None:
+                best_df = initial_cluster(df_base.copy())
+                best_summary = cluster_summary(best_df, "Fallback")
+        
+            return best_df, best_summary
+        
+        
+        # === MAIN EXECUTION ===
+        best_df, best_summary = best_by_std_dev(df.copy())
+        df_final = fix_final_imbalance_best(best_df.copy())
+        final_summary = cluster_summary(df_final, "Final")
+        
+        
+        
+        
+        # === HELPER FUNCTIONS ===
+        def merge_with_nearest_cluster_safe(df, cid):
+            cluster_df = df[df['Cluster'] == cid]
+            if cluster_df.empty:
+                return df
+        
+            nearest = df[df['Cluster'] != cid].copy()
+            nearest['dist'] = nearest['Coords'].apply(
+                lambda x: compute_distance(x, cluster_df['Coords'].iloc[0])
+            )
+        
+            nearest_clusters = nearest.groupby('Cluster')['dist'].mean().sort_values().index.tolist()
+            for nc in nearest_clusters:
+                temp_df = df.copy()
+                temp_df.loc[temp_df['Cluster'] == cid, 'Cluster'] = nc
+                temp_summary = cluster_summary(temp_df, "Merge_Test")
+                nc_time = temp_summary[temp_summary['Cluster_ID'] == nc]['Time_Minutes'].iloc[0]
+                if nc_time <= MAX_TIME_ABS:
+        
+                    return temp_df
+        
+        
+            return df
+        
+        def split_cluster(df, cid):
+            cluster_df = df[df['Cluster'] == cid]
+            if len(cluster_df) < 4:
+                return df
+            keep_df = df[df['Cluster'] != cid]
+            km = KMeans(n_clusters=2, random_state=42).fit(
+                cluster_df[['Final_Latitude', 'Final_Longitude']]
+            )
+            cluster_df['Cluster'] = km.labels_ + df['Cluster'].max() + 1
+            return pd.concat([keep_df, cluster_df], ignore_index=True)
+        
+        def split_until_balanced(df):
+        
+            while True:
+                summary = cluster_summary(df, "Split_Check")
+                overloaded = summary[
+                    ((summary['Time_Minutes'] > MAX_TIME) | (summary['Points'] > MAX_POINTS))
+                    & (summary['Time_Minutes'] >= 90)
+                ]
+                if overloaded.empty:
+                    break
+                for cid in overloaded['Cluster_ID']:
+                    time_val = summary.loc[summary['Cluster_ID'] == cid, 'Time_Minutes'].iloc[0]
+                    df = split_cluster(df, cid)
+            return df
+        
+        def strict_balance(df, max_loops=30):
+            for loop in range(max_loops):
+                summary = cluster_summary(df, f"Strict_{loop+1}")
+                max_time = summary['Time_Minutes'].max()
+                min_time = summary['Time_Minutes'].min()
+                avg_time = summary['Time_Minutes'].mean()
+        
+                changed = False
+        
+                # Split overloaded clusters (skip < 90 mins)
+                overloaded = summary[
+                    ((summary['Time_Minutes'] > MAX_TIME_ABS) | (summary['Points'] > MAX_POINTS))
+                    & (summary['Time_Minutes'] >= 90)
+                ]
+                for cid in overloaded['Cluster_ID']:
+                    df = split_cluster(df, cid)
+                    changed = True
+        
+                # Merge underused clusters safely
+                summary = cluster_summary(df, f"Strict_{loop+1}_postsplit")
+                underused = summary[summary['Time_Minutes'] < MIN_TIME]['Cluster_ID'].tolist()
+                for cid in underused:
+                    if df['Cluster'].nunique() <= 2:
+                        break
+                    df = merge_with_nearest_cluster_safe(df, cid)
+                    changed = True
+        
+                if not changed:
+                    return df
+        
+            return df
+        
+        # === TRANSFER POINTS FOR CASCADE ===
+        def transfer_points(df, from_cluster, to_cluster, max_moves=3):
+            high_df = df[df['Cluster'] == from_cluster]
+            low_df = df[df['Cluster'] == to_cluster]
+            if high_df.empty or low_df.empty:
+                return df, False
+        
+            distances = [
+                (idx, compute_distance(row['Coords'], low_df['Coords'].iloc[0]))
+                for idx, row in high_df.iterrows()
+            ]
+            distances.sort(key=lambda x: x[1])
+        
+            moved = False
+            for move_count in range(1, min(max_moves, len(distances)) + 1):
+                to_move = [idx for idx, _ in distances[:move_count]]
+                temp_df = df.copy()
+                temp_df.loc[to_move, 'Cluster'] = to_cluster
+                new_summary = cluster_summary(temp_df, "Test_Move")
+        
+                if (new_summary[new_summary['Cluster_ID'] == to_cluster]['Time_Minutes'].iloc[0] <= MAX_TIME_ABS and
+                    new_summary[new_summary['Cluster_ID'] == from_cluster]['Time_Minutes'].iloc[0] >= MIN_TIME):
+                    df = temp_df
+                    moved = True
+                    break
+            return df, moved
+        
+        def cascade_rebalance(df, max_loops=20, max_dev_allowed=20):
+            """
+            Cascade point transfers from high → medium → low clusters until balanced.
+            """
+            for loop in range(max_loops):
+                summary = cluster_summary(df, f"Cascade_{loop+1}")
+                summary = summary.sort_values(by="Time_Minutes", ascending=False)
+                max_time = summary['Time_Minutes'].iloc[0]
+                min_time = summary['Time_Minutes'].iloc[-1]
+                max_dev = max_time - min_time
+        
+                if max_dev <= max_dev_allowed:
+                    break
+        
+                moved_any = False
+                high_cluster = summary['Cluster_ID'].iloc[0]
+                for idx in range(1, len(summary)):
+                    low_cluster = summary['Cluster_ID'].iloc[idx]
+                    df, moved = transfer_points(df, high_cluster, low_cluster, max_moves=3)
+                    if moved:
+                        moved_any = True
+                        break
+        
+                if not moved_any:
+                    break
+        
+            return df
+        
+        # === MAIN EXECUTION PIPELINE ===
+        best_df, best_summary = best_by_std_dev(df.copy())
+        
+        # Step 1: Split overloaded clusters
+        best_df = split_until_balanced(best_df.copy())
+        
+        # Step 2: Strict balancing
+        balanced_df = strict_balance(best_df.copy())
+        
+        # Step 3: Cascade rebalance
+        balanced_df = cascade_rebalance(balanced_df.copy())
+        
+        # Step 4: Final imbalance fix
+        df_final = fix_final_imbalance_best(balanced_df.copy())
+        final_summary = cluster_summary(df_final, "Final")
+        
+        
+        ROUTE_PLAN_FILE = f"/home/ubuntu/delivery_executive_routes_plan_{session.upper()}.txt"
+        
+        # === LOAD DATA ===
+        
+        summary_df = final_summary
+        
+        # Ensure Coords column exists
+        if "Coords" not in df_final.columns:
+            df_final["Coords"] = list(zip(df_final["Final_Latitude"], df_final["Final_Longitude"]))
+        
+        # Ensure Coords are tuples
+        df_final["Coords"] = df_final["Coords"].apply(lambda x: eval(str(x)) if isinstance(x, str) else x)
+        
+        # === HELPER FUNCTIONS ===
+        def compute_distance(coord1, coord2):
+            return haversine(coord1, coord2)
+        
+        def route_distance(coords):
+            """Calculate total distance including return to hub."""
+            total = 0
+            last = DEPOT
+            for c in coords:
+                total += compute_distance(last, c)
+                last = c
+            total += compute_distance(last, DEPOT)
+            return round(total, 1)
+        
+        def calculate_time(distance_km):
+            return round((distance_km / AVERAGE_SPEED) * 60, 1)  # minutes
+        
+        def nearest_neighbor_route(coords):
+            """Basic nearest neighbor route for initial path."""
+            if not coords:
+                return []
+        
+            unvisited = list(coords)
+            route = [unvisited.pop(0)]
+            while unvisited:
+                next_point = min(unvisited, key=lambda x: compute_distance(route[-1], x))
+                route.append(next_point)
+                unvisited.remove(next_point)
+            return route
+            
+        def two_opt(route):
+            best = route
+            improved = True
+            while improved:
+                improved = False
+                for i in range(1, len(best) - 2):
+                    for j in range(i + 1, len(best)):
+                        if j - i == 1: 
+                            continue
+                        new_route = best[:i] + best[i:j][::-1] + best[j:]
+                        if route_distance(new_route) < route_distance(best):
+                            best = new_route
+                            improved = True
+                route = best
+            return best
+        
+        def selective_three_opt(route):
+            """Selective 3-opt swaps for speed."""
+            best = route
+            best_distance = route_distance(route)
+            n = len(route)
+            improved = True
+            while improved:
+                improved = False
+                for i in range(0, n-4, 2):
+                    for j in range(i+2, n-2, 2):
+                        for k in range(j+2, n, 2):
+                            A, B, C = route[i:j], route[j:k], route[k:]
+                            new_routes = [
+                                route[:i] + A[::-1] + B + C,
+                                route[:i] + A + B[::-1] + C,
+                                route[:i] + B + A + C
+                            ]
+                            for nr in new_routes:
+                                d = route_distance(nr)
+                                if d < best_distance:
+                                    best = nr
+                                    best_distance = d
+                                    improved = True
+                route = best
+            return best
+        
+        def selective_four_opt(route):
+            """Selective 4-opt swaps."""
+            best = route
+            best_distance = route_distance(route)
+            n = len(route)
+            for i in range(0, n-5, 3):
+                for j in range(i+2, n-3, 3):
+                    for k in range(j+2, n-1, 3):
+                        for l in range(k+2, n, 3):
+                            new_route = route[:i] + route[i:j][::-1] + route[j:k][::-1] + route[k:l][::-1] + route[l:]
+                            d = route_distance(new_route)
+                            if d < best_distance:
+                                best = new_route
+                                best_distance = d
+            return best
+        
+        def hybrid_optimize(route):
+            """Hybrid optimization: 2-opt + selective 3-opt + selective 4-opt."""
+            best_route = two_opt(route)
+            best_route = selective_three_opt(best_route)
+            best_route = selective_four_opt(best_route)
+            return best_route
+        
+        def optimize_route_with_duplicates(coords):
+            if not coords:
+                return []
+            initial = nearest_neighbor_route(coords)
+            optimized = hybrid_optimize(initial)
+            return optimized
+        
+        # === GOOGLE MAPS LINKS ===
+        def create_google_maps_links(coords_list):
+            urls = []
+            start = 0
+            while start < len(coords_list):
+                end = min(start + MAX_WAYPOINTS, len(coords_list))
+                chunk = coords_list[start:end]
+                waypoints = "/".join([f"{lat},{lng}" for lat, lng in chunk])
+                if start == 0:
+                    url = f"https://www.google.com/maps/dir/{DEPOT[0]},{DEPOT[1]}/{waypoints}"
+                else:
+                    url = f"https://www.google.com/maps/dir/{coords_list[start-1][0]},{coords_list[start-1][1]}/{waypoints}"
+                if end == len(coords_list):
+                    url += f"/{DEPOT[0]},{DEPOT[1]}"
+                urls.append(url)
+                start += MAX_WAYPOINTS
+            return urls
+            
+        bucket_name = "delivery-route-plans"          
+        total_customers = len(df_final)
+        total_executives = df_final['Cluster'].nunique()
+        
+        route_plan_files[session] = f"/home/ubuntu/route_plan_{session.lower()}.txt"
+        map_links_files[session] = f"/home/ubuntu/map_links_{session.lower()}.html"
+        
+        with open(route_plan_files[session], "w", encoding="utf-8") as f, \
+             open(map_links_files[session], "w", encoding="utf-8") as map_file:
+        
+            f.write("========== DELIVERY ROUTE PLAN ==========\n")
+            f.write(f"Session: {session}\n")
+            f.write(f"Total Customers: {total_customers}\n")
+            f.write(f"Total Delivery Executives: {total_executives}\n")
+            f.write("===========================================\n\n")
+        
+            map_file.write(f"""<!DOCTYPE html>
+        <html lang="en">
+        <head>
+        <meta charset="UTF-8" />
+        <title>Map Links - {session}</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 20px; }}
+            h1 {{ color: #2a7ae2; }}
+            ul {{ list-style-type: none; padding-left: 0; }}
+            li {{ margin-bottom: 10px; }}
+            a {{ color: #1a0dab; text-decoration: none; }}
+            a:hover {{ text-decoration: underline; }}
+        </style>
+        </head>
+        <body>
+        <h1>Map Links for {session} Session</h1>
+        <ul>
+        """)
+        
+            for driver_num, (cluster_id, group) in enumerate(df_final.groupby("Cluster"), 1):
+                executive_name = EXECUTIVE_NAMES[(driver_num - 1) % len(EXECUTIVE_NAMES)]
+                
+        
+                f.write(f"{driver_num} (Delivery Executive {driver_num}):\n")
+                f.write(f"{executive_name} :\n")
+                f.write(f"  Start at Hub: {DEPOT}\n")
+        
+                group = group.copy()
+                coords_list = list(group["Coords"])
+                optimized_coords = optimize_route_with_duplicates(coords_list)
+        
+                # Maintain row identity (sort group by optimized coords)
+                optimized_rows = []
+                temp_group = group.copy()
+                for c in optimized_coords:
+                    match_idx = temp_group.index[temp_group["Coords"] == c][0]
+                    optimized_rows.append(temp_group.loc[match_idx])
+                    temp_group = temp_group.drop(match_idx)
+        
+                # Write stops
+                for i, row in enumerate(optimized_rows, 1):
+                    f.write(
+                        f"  Stop {i}: {row['Delivery_Name']}, {row['Location']} "
+                        f"- ({row['Final_Latitude']}, {row['Final_Longitude']}), "
+                        f"Packages: {row['Packages']}\n"
+                    )
+        
+                # Distance and time
+                total_km = route_distance(optimized_coords)
+                total_time = calculate_time(total_km)
+                f.write(f"  Return to Hub: {DEPOT}\n")
+                f.write(f"  >>> Total Distance (Optimized): {total_km:.1f} km\n")
+                f.write(f"  >>> Total Expected Time: {total_time:.1f} minutes\n")
+        
+                # Google Maps links
+                map_links = create_google_maps_links(optimized_coords)
+                for idx, link in enumerate(map_links, 1):
+                    f.write(f"  🌐 Route Plan for {executive_name} (Map {idx}): {link}\n")
+        
+                num_customers = len(optimized_rows)
+                map_file.write(f"<li><strong>{executive_name} (Delivery Executive {driver_num}), {num_customers} customers</strong><br>\n")
+                for idx, link in enumerate(map_links, 1):
+                    map_file.write(f'<a href="{link}" target="_blank">Map {idx}</a><br>\n')
+                map_file.write("</li>\n")
+                
+
+                f.write("\n")
+
+                exec_file = f"/home/ubuntu/map_links_{session.lower()}_{executive_name.replace(' ', '_')}.html"
+                executive_html_files[(session, executive_name)] = exec_file
+                with open(exec_file, "w", encoding="utf-8") as exec_map_file:
+                    exec_map_file.write(f"""<!DOCTYPE html>
+                <html lang="en">
+                <head>
+                <meta charset="UTF-8" />
+                <title>Map Links - {session} - {executive_name.replace(' ', '_')}</title>
+                <style>
+                  body {{ font-family: Arial, sans-serif; margin: 20px; }}
+                  h1 {{ color: #2a7ae2; }}
+                  ul {{ list-style-type: none; padding-left: 0; }}
+                  li {{ margin-bottom: 10px; }}
+                  a {{ color: #1a0dab; text-decoration: none; }}
+                  a:hover {{ text-decoration: underline; }}
+                </style>
+                </head>
+                <body>
+                <h1>Map Links for {session} Session - {executive_name}</h1>
+                <ul>
+                """)
+                    for idx, lnk in enumerate(map_links, 1):
+                        exec_map_file.write(f'<li><a href="{lnk}" target="_blank">Map {idx}</a></li>\n')
+                    exec_map_file.write("</ul></body></html>")
+
+            map_file.write("""
+            </ul>
+            </body>
+            </html>
+            """)
+
+    end_time = time.time()
+    print(f"✅ TXT route_plan generated: {route_plan_files[session]} ({end_time - start_time:.2f} seconds)")
+    print(f"✅ Map links file generated: {map_links_files[session]}")
+
+    # After all sessions are processed, upload per-executive files too:
+    for _, path in executive_html_files.items():
+        upload_to_s3(path, bucket_name)
+    
+    # Existing session files upload and email sending:
+    s3_links = []
+    for session in sessions:
+        s3_links.append(upload_to_s3(route_plan_files[session], bucket_name))
+        s3_links.append(upload_to_s3(map_links_files[session], bucket_name))
+    
+    """send_email_with_s3_links(
+        to_list=["ajay.g@jayskeralaenterprises.com"],
+        subject="Delivery Route Plan - Breakfast, Lunch, Dinner",
+        links=s3_links
+    )"""
+                
+            
+            # In[17]:
+            
+  
+    
+    # Collect all session-specific files
+    all_reports = []
+    
+    
+    s3_links = []
+    for session in sessions:
+        s3_links.append(upload_to_s3(route_plan_files[session], bucket_name))
+        s3_links.append(upload_to_s3(map_links_files[session], bucket_name))
+    
+      
+    """send_email_with_s3_links(
+        to_list=["ajay.g@jayskeralaenterprises.com"],
+        subject="Delivery Route Plan - Breakfast, Lunch, Dinner",
+        links=s3_links
+    )"""
+
+if __name__ == "__main__":
+    run_delivery_script()
